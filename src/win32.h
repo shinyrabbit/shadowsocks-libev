@@ -1,5 +1,5 @@
 /*
- * win32.c - Win32 port helpers
+ * win32.h - Win32 port helpers
  *
  * Copyright (C) 2014, Linus Yang <linusyang@gmail.com>
  *
@@ -59,7 +59,6 @@
 #ifndef IPV6_V6ONLY
 #define IPV6_V6ONLY 27 // Treat wildcard bind as AF_INET6-only.
 #endif
-
 
 #define EWOULDBLOCK WSAEWOULDBLOCK
 #define errno WSAGetLastError()

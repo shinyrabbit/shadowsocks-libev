@@ -1,7 +1,7 @@
 /*
  * acl.c - Manage the ACL (Access Control List)
  *
- * Copyright (C) 2013 - 2015, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -23,9 +23,12 @@
 #include <ipset/ipset.h>
 
 #include "utils.h"
+#include "acl.h"
 
 static struct ip_set acl_ipv4_set;
 static struct ip_set acl_ipv6_set;
+
+static int acl_mode = BLACK_LIST;
 
 static void parse_addr_cidr(const char *str, char *host, int *cidr)
 {
@@ -44,12 +47,14 @@ static void parse_addr_cidr(const char *str, char *host, int *cidr)
     } else {
         memcpy(host, str, ret);
         host[ret] = '\0';
-        *cidr = atoi(str + ret + 1);
+        *cidr     = atoi(str + ret + 1);
     }
 }
 
-int init_acl(const char *path)
+int init_acl(const char *path, int mode)
 {
+    acl_mode = mode;
+
     // initialize ipset
     ipset_init_library();
     ipset_init(&acl_ipv4_set);
@@ -61,8 +66,8 @@ int init_acl(const char *path)
         return -1;
     }
 
-    char line[256];
-    while (!feof(f)) {
+    char line[257];
+    while (!feof(f))
         if (fgets(line, 256, f)) {
             // Trim the newline
             int len = strlen(line);
@@ -70,7 +75,7 @@ int init_acl(const char *path)
                 line[len - 1] = '\0';
             }
 
-            char host[256];
+            char host[257];
             int cidr;
             parse_addr_cidr(line, host, &cidr);
 
@@ -92,7 +97,6 @@ int init_acl(const char *path)
                 }
             }
         }
-    }
 
     fclose(f);
 
@@ -105,18 +109,61 @@ void free_acl(void)
     ipset_done(&acl_ipv6_set);
 }
 
-int acl_contains_ip(const char * host)
+int acl_get_mode(void)
+{
+    return acl_mode;
+}
+
+int acl_match_ip(const char *ip)
 {
     struct cork_ip addr;
-    int err = cork_ip_init(&addr, host);
-    if (err) {
+    int ret = cork_ip_init(&addr, ip);
+    if (ret) {
         return 0;
     }
 
     if (addr.version == 4) {
-        return ipset_contains_ipv4(&acl_ipv4_set, &(addr.ip.v4));
+        ret = ipset_contains_ipv4(&acl_ipv4_set, &(addr.ip.v4));
     } else if (addr.version == 6) {
-        return ipset_contains_ipv6(&acl_ipv6_set, &(addr.ip.v6));
+        ret = ipset_contains_ipv6(&acl_ipv6_set, &(addr.ip.v6));
+    }
+
+    if (acl_mode == WHITE_LIST) {
+        ret = !ret;
+    }
+
+    return ret;
+}
+
+int acl_add_ip(const char *ip)
+{
+    struct cork_ip addr;
+    int err = cork_ip_init(&addr, ip);
+    if (err) {
+        return -1;
+    }
+
+    if (addr.version == 4) {
+        ipset_ipv4_add(&acl_ipv4_set, &(addr.ip.v4));
+    } else if (addr.version == 6) {
+        ipset_ipv6_add(&acl_ipv6_set, &(addr.ip.v6));
+    }
+
+    return 0;
+}
+
+int acl_remove_ip(const char *ip)
+{
+    struct cork_ip addr;
+    int err = cork_ip_init(&addr, ip);
+    if (err) {
+        return -1;
+    }
+
+    if (addr.version == 4) {
+        ipset_ipv4_remove(&acl_ipv4_set, &(addr.ip.v4));
+    } else if (addr.version == 6) {
+        ipset_ipv6_remove(&acl_ipv6_set, &(addr.ip.v6));
     }
 
     return 0;

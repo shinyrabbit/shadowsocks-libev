@@ -1,7 +1,7 @@
 /*
- * local.h - Define the clinet's buffers and callbacks
+ * local.h - Define the client's buffers and callbacks
  *
- * Copyright (C) 2013 - 2015, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -31,27 +31,26 @@
 
 #include "common.h"
 
-struct listen_ctx {
+typedef struct listen_ctx {
     ev_io io;
     char *iface;
     int remote_num;
     int method;
     int timeout;
     int fd;
+    int mptcp;
     struct sockaddr **remote_addr;
-};
+} listen_ctx_t;
 
-struct server_ctx {
+typedef struct server_ctx {
     ev_io io;
     int connected;
     struct server *server;
-};
+} server_ctx_t;
 
-struct server {
+typedef struct server {
     int fd;
-    ssize_t buf_len;
-    ssize_t buf_idx;
-    char *buf; // server send from, remote recv into
+    buffer_t *buf;
     char stage;
     struct enc_ctx *e_ctx;
     struct enc_ctx *d_ctx;
@@ -61,26 +60,25 @@ struct server {
     struct remote *remote;
 
     struct cork_dllist_item entries;
-};
+} server_t;
 
-struct remote_ctx {
+typedef struct remote_ctx {
     ev_io io;
     ev_timer watcher;
     int connected;
     struct remote *remote;
-};
+} remote_ctx_t;
 
-struct remote {
+typedef struct remote {
     int fd;
-    ssize_t buf_len;
-    ssize_t buf_idx;
+    buffer_t *buf;
     int direct;
-    char *buf; // remote send from, server recv into
     struct remote_ctx *recv_ctx;
     struct remote_ctx *send_ctx;
     struct server *server;
     struct sockaddr_storage addr;
     int addr_len;
-};
+    uint32_t counter;
+} remote_t;
 
 #endif // _LOCAL_H

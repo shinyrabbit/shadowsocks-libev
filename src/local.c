@@ -1,7 +1,7 @@
 /*
  * local.c - Setup a socks5 proxy through remote shadowsocks server
  *
- * Copyright (C) 2013 - 2015, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -80,11 +80,17 @@
 #endif
 
 int verbose = 0;
+int keep_resolving = 1;
+
 #ifdef ANDROID
-int vpn = 0;
+int vpn        = 0;
+uint64_t tx    = 0;
+uint64_t rx    = 0;
+ev_tstamp last = 0;
+char *prefix;
 #endif
 
-static int acl = 0;
+static int acl  = 0;
 static int mode = TCP_ONLY;
 
 static int fast_open = 0;
@@ -94,6 +100,8 @@ static int nofile = 0;
 #endif
 #endif
 
+static int auth = 0;
+
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
 static void server_send_cb(EV_P_ ev_io *w, int revents);
 static void remote_recv_cb(EV_P_ ev_io *w, int revents);
@@ -102,14 +110,14 @@ static void accept_cb(EV_P_ ev_io *w, int revents);
 static void signal_cb(EV_P_ ev_signal *w, int revents);
 
 static int create_and_bind(const char *addr, const char *port);
-static struct remote * create_remote(struct listen_ctx *listener, struct sockaddr *addr);
-static void free_remote(struct remote *remote);
-static void close_and_free_remote(EV_P_ struct remote *remote);
-static void free_server(struct server *server);
-static void close_and_free_server(EV_P_ struct server *server);
+static remote_t *create_remote(listen_ctx_t *listener, struct sockaddr *addr);
+static void free_remote(remote_t *remote);
+static void close_and_free_remote(EV_P_ remote_t *remote);
+static void free_server(server_t *server);
+static void close_and_free_server(EV_P_ server_t *server);
 
-static struct remote * new_remote(int fd, int timeout);
-static struct server * new_server(int fd, int method);
+static remote_t *new_remote(int fd, int timeout);
+static server_t *new_server(int fd, int method);
 
 static struct cork_dllist connections;
 
@@ -122,18 +130,7 @@ int setnonblocking(int fd)
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
-#endif
 
-#ifdef SET_INTERFACE
-int setinterface(int socket_fd, const char * interface_name)
-{
-    struct ifreq interface;
-    memset(&interface, 0, sizeof(interface));
-    strncpy(interface.ifr_name, interface_name, IFNAMSIZ);
-    int res = setsockopt(socket_fd, SOL_SOCKET, SO_BINDTODEVICE, &interface,
-                         sizeof(struct ifreq));
-    return res;
-}
 #endif
 
 int create_and_bind(const char *addr, const char *port)
@@ -143,7 +140,7 @@ int create_and_bind(const char *addr, const char *port)
     int s, listen_sock;
 
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_family = AF_UNSPEC;     /* Return IPv4 and IPv6 choices */
+    hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
     hints.ai_socktype = SOCK_STREAM; /* We want a TCP socket */
 
     s = getaddrinfo(addr, port, &hints, &result);
@@ -163,6 +160,10 @@ int create_and_bind(const char *addr, const char *port)
 #ifdef SO_NOSIGPIPE
         setsockopt(listen_sock, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
+        int err = set_reuseport(listen_sock);
+        if (err == 0) {
+            LOGI("tcp port reuse enabled");
+        }
 
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
         if (s == 0) {
@@ -187,12 +188,10 @@ int create_and_bind(const char *addr, const char *port)
 
 static void free_connections(struct ev_loop *loop)
 {
-    struct cork_dllist_item *curr;
-    for (curr = cork_dllist_start(&connections);
-         !cork_dllist_is_end(&connections, curr);
-         curr = curr->next) {
-        struct server *server = cork_container_of(curr, struct server, entries);
-        struct remote *remote = server->remote;
+    struct cork_dllist_item *curr, *next;
+    cork_dllist_foreach_void(&connections, curr, next) {
+        server_t *server = cork_container_of(curr, server_t, entries);
+        remote_t *remote = server->remote;
         close_and_free_server(loop, server);
         close_and_free_remote(loop, remote);
     }
@@ -200,10 +199,11 @@ static void free_connections(struct ev_loop *loop)
 
 static void server_recv_cb(EV_P_ ev_io *w, int revents)
 {
-    struct server_ctx *server_recv_ctx = (struct server_ctx *)w;
-    struct server *server = server_recv_ctx->server;
-    struct remote *remote = server->remote;
-    char *buf;
+    server_ctx_t *server_recv_ctx = (server_ctx_t *)w;
+    server_t *server              = server_recv_ctx->server;
+    remote_t *remote              = server->remote;
+    buffer_t *buf;
+    ssize_t r;
 
     if (remote == NULL) {
         buf = server->buf;
@@ -211,27 +211,28 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         buf = remote->buf;
     }
 
-    ssize_t r;
-
-    r = recv(server->fd, buf, BUF_SIZE, 0);
+    r = recv(server->fd, buf->array, BUF_SIZE, 0);
 
     if (r == 0) {
         // connection closed
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
-    } else if (r < 0) {
+    } else if (r == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data
             // continue to wait for recv
             return;
         } else {
-            ERROR("server_recv_cb_recv");
+            if (verbose)
+                ERROR("server_recv_cb_recv");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
             return;
         }
     }
+
+    buf->len = r;
 
     while (1) {
         // local socks5 server
@@ -242,12 +243,18 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
 
+            if (!remote->direct && remote->send_ctx->connected && auth) {
+                ss_gen_hash(remote->buf, &remote->counter, server->e_ctx, BUF_SIZE);
+            }
+
             // insert shadowsocks header
             if (!remote->direct) {
-                remote->buf = ss_encrypt(BUF_SIZE, remote->buf, &r,
-                                         server->e_ctx);
+#ifdef ANDROID
+                tx += remote->buf->len;
+#endif
+                int err = ss_encrypt(remote->buf, server->e_ctx, BUF_SIZE);
 
-                if (remote->buf == NULL) {
+                if (err) {
                     LOGE("invalid password or cipher");
                     close_and_free_remote(EV_A_ remote);
                     close_and_free_server(EV_A_ server);
@@ -256,7 +263,6 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
             }
 
             if (!remote->send_ctx->connected) {
-
 #ifdef ANDROID
                 if (vpn) {
                     if (protect_socket(remote->fd) == -1) {
@@ -268,34 +274,59 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                 }
 #endif
 
-                remote->buf_idx = 0;
-                remote->buf_len = r;
+                remote->buf->idx = 0;
 
                 if (!fast_open || remote->direct) {
                     // connecting, wait until connected
-                    connect(remote->fd, (struct sockaddr *)&(remote->addr), remote->addr_len);
+                    int r = connect(remote->fd, (struct sockaddr *)&(remote->addr), remote->addr_len);
 
-                    // wait on remote connected event
-                    ev_io_stop(EV_A_ & server_recv_ctx->io);
-                    ev_io_start(EV_A_ & remote->send_ctx->io);
-                    ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+                    if (r == -1 && errno != CONNECT_IN_PROGRESS) {
+                        ERROR("connect");
+                        close_and_free_remote(EV_A_ remote);
+                        close_and_free_server(EV_A_ server);
+                        return;
+                    }
+
+                    if (r == 0) {
+                        if (verbose) LOGI("connected immediately");
+                        remote_send_cb(EV_A_ & remote->send_ctx->io, 0);
+                    } else {
+                        // wait on remote connected event
+                        ev_io_stop(EV_A_ & server_recv_ctx->io);
+                        ev_io_start(EV_A_ & remote->send_ctx->io);
+                        ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+                    }
+
                 } else {
 #ifdef TCP_FASTOPEN
-                    int s = sendto(remote->fd, remote->buf, r, MSG_FASTOPEN,
+#ifdef __APPLE__
+                    ((struct sockaddr_in *)&(remote->addr))->sin_len = sizeof(struct sockaddr_in);
+                    sa_endpoints_t endpoints;
+                    bzero((char *)&endpoints, sizeof(endpoints));
+                    endpoints.sae_dstaddr    = (struct sockaddr *)&(remote->addr);
+                    endpoints.sae_dstaddrlen = remote->addr_len;
+
+                    int s = connectx(remote->fd, &endpoints, SAE_ASSOCID_ANY,
+                                     CONNECT_RESUME_ON_READ_WRITE | CONNECT_DATA_IDEMPOTENT,
+                                     NULL, 0, NULL, NULL);
+                    if (s == 0) {
+                        s = send(remote->fd, remote->buf->array, remote->buf->len, 0);
+                    }
+#else
+                    int s = sendto(remote->fd, remote->buf->array, remote->buf->len, MSG_FASTOPEN,
                                    (struct sockaddr *)&(remote->addr), remote->addr_len);
+#endif
                     if (s == -1) {
-                        if (errno == EINPROGRESS) {
+                        if (errno == CONNECT_IN_PROGRESS) {
                             // in progress, wait until connected
-                            remote->buf_idx = 0;
-                            remote->buf_len = r;
+                            remote->buf->idx = 0;
                             ev_io_stop(EV_A_ & server_recv_ctx->io);
                             ev_io_start(EV_A_ & remote->send_ctx->io);
                             return;
                         } else {
                             ERROR("sendto");
                             if (errno == ENOTCONN) {
-                                LOGE(
-                                    "fast open is not supported on this platform");
+                                LOGE("fast open is not supported on this platform");
                                 // just turn it off
                                 fast_open = 0;
                             }
@@ -303,9 +334,9 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                             close_and_free_server(EV_A_ server);
                             return;
                         }
-                    } else if (s < r) {
-                        remote->buf_len = r - s;
-                        remote->buf_idx = s;
+                    } else if (s <= (int)(remote->buf->len)) {
+                        remote->buf->len -= s;
+                        remote->buf->idx  = s;
                     }
 
                     // Just connected
@@ -319,12 +350,11 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 #endif
                 }
             } else {
-                int s = send(remote->fd, remote->buf, r, 0);
+                int s = send(remote->fd, remote->buf->array, remote->buf->len, 0);
                 if (s == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         // no data, wait for send
-                        remote->buf_idx = 0;
-                        remote->buf_len = r;
+                        remote->buf->idx = 0;
                         ev_io_stop(EV_A_ & server_recv_ctx->io);
                         ev_io_start(EV_A_ & remote->send_ctx->io);
                         return;
@@ -334,9 +364,9 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                         close_and_free_server(EV_A_ server);
                         return;
                     }
-                } else if (s < r) {
-                    remote->buf_len = r - s;
-                    remote->buf_idx = s;
+                } else if (s < (int)(remote->buf->len)) {
+                    remote->buf->len -= s;
+                    remote->buf->idx  = s;
                     ev_io_stop(EV_A_ & server_recv_ctx->io);
                     ev_io_start(EV_A_ & remote->send_ctx->io);
                     return;
@@ -347,14 +377,22 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
             return;
         } else if (server->stage == 0) {
             struct method_select_response response;
-            response.ver = SVERSION;
+            response.ver    = SVERSION;
             response.method = 0;
             char *send_buf = (char *)&response;
             send(server->fd, send_buf, sizeof(response), 0);
             server->stage = 1;
+
+            int off = (buf->array[1] & 0xff) + 2;
+            if (buf->array[0] == 0x05 && off < (int)(buf->len)) {
+                memmove(buf->array, buf->array + off, buf->len - off);
+                buf->len -= off;
+                continue;
+            }
+
             return;
         } else if (server->stage == 1) {
-            struct socks5_request *request = (struct socks5_request *)buf;
+            struct socks5_request *request = (struct socks5_request *)buf->array;
 
             struct sockaddr_in sock_addr;
             memset(&sock_addr, 0, sizeof(sock_addr));
@@ -372,9 +410,9 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
             } else if (request->cmd != 1) {
                 LOGE("unsupported cmd: %d", request->cmd);
                 struct socks5_response response;
-                response.ver = SVERSION;
-                response.rep = CMD_NOT_SUPPORTED;
-                response.rsv = 0;
+                response.ver  = SVERSION;
+                response.rep  = CMD_NOT_SUPPORTED;
+                response.rsv  = 0;
                 response.atyp = 1;
                 char *send_buf = (char *)&response;
                 send(server->fd, send_buf, 4, 0);
@@ -382,57 +420,55 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_server(EV_A_ server);
                 return;
             } else {
-                char host[256], port[16];
-                char ss_addr_to_send[320];
+                char host[257], port[16];
 
-                ssize_t addr_len = 0;
-                ss_addr_to_send[addr_len++] = request->atyp;
+                buffer_t ss_addr_to_send;
+                buffer_t *abuf = &ss_addr_to_send;
+                balloc(abuf, BUF_SIZE);
+
+                abuf->array[abuf->len++] = request->atyp;
 
                 // get remote addr and port
                 if (request->atyp == 1) {
                     // IP V4
                     size_t in_addr_len = sizeof(struct in_addr);
-                    memcpy(ss_addr_to_send + addr_len, buf + 4, in_addr_len +
-                           2);
-                    addr_len += in_addr_len + 2;
+                    memcpy(abuf->array + abuf->len, buf->array + 4, in_addr_len + 2);
+                    abuf->len += in_addr_len + 2;
 
                     if (acl || verbose) {
-                        uint16_t p =
-                            ntohs(*(uint16_t *)(buf + 4 + in_addr_len));
-                        dns_ntop(AF_INET, (const void *)(buf + 4),
+                        uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in_addr_len));
+                        dns_ntop(AF_INET, (const void *)(buf->array + 4),
                                  host, INET_ADDRSTRLEN);
                         sprintf(port, "%d", p);
                     }
                 } else if (request->atyp == 3) {
                     // Domain name
-                    uint8_t name_len = *(uint8_t *)(buf + 4);
-                    ss_addr_to_send[addr_len++] = name_len;
-                    memcpy(ss_addr_to_send + addr_len, buf + 4 + 1, name_len +
-                           2);
-                    addr_len += name_len + 2;
+                    uint8_t name_len = *(uint8_t *)(buf->array + 4);
+                    abuf->array[abuf->len++] = name_len;
+                    memcpy(abuf->array + abuf->len, buf->array + 4 + 1, name_len + 2);
+                    abuf->len += name_len + 2;
 
                     if (acl || verbose) {
                         uint16_t p =
-                            ntohs(*(uint16_t *)(buf + 4 + 1 + name_len));
-                        memcpy(host, buf + 4 + 1, name_len);
+                            ntohs(*(uint16_t *)(buf->array + 4 + 1 + name_len));
+                        memcpy(host, buf->array + 4 + 1, name_len);
                         host[name_len] = '\0';
                         sprintf(port, "%d", p);
                     }
                 } else if (request->atyp == 4) {
                     // IP V6
                     size_t in6_addr_len = sizeof(struct in6_addr);
-                    memcpy(ss_addr_to_send + addr_len, buf + 4, in6_addr_len +
-                           2);
-                    addr_len += in6_addr_len + 2;
+                    memcpy(abuf->array + abuf->len, buf->array + 4, in6_addr_len + 2);
+                    abuf->len += in6_addr_len + 2;
 
                     if (acl || verbose) {
-                        uint16_t p =
-                            ntohs(*(uint16_t *)(buf + 4 + in6_addr_len));
-                        dns_ntop(AF_INET6, (const void *)(buf + 4),
+                        uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in6_addr_len));
+                        dns_ntop(AF_INET6, (const void *)(buf->array + 4),
                                  host, INET6_ADDRSTRLEN);
                         sprintf(port, "%d", p);
                     }
                 } else {
+                    bfree(abuf);
                     LOGE("unsupported addrtype: %d", request->atyp);
                     close_and_free_remote(EV_A_ remote);
                     close_and_free_server(EV_A_ server);
@@ -441,21 +477,26 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
                 server->stage = 5;
 
-                r -= (3 + addr_len);
-                buf += (3 + addr_len);
-
-                if (verbose) {
-                    LOGI("connect to %s:%s", host, port);
+                buf->len -= (3 + abuf->len);
+                if (buf->len > 0) {
+                    memmove(buf->array, buf->array + 3 + abuf->len, buf->len);
                 }
 
-                if ((acl && (request->atyp == 1 || request->atyp == 4) && acl_contains_ip(host))) {
+                if (verbose) {
+                    if (request->atyp == 4)
+                        LOGI("connect to [%s]:%s", host, port);
+                    else
+                        LOGI("connect to %s:%s", host, port);
+                }
+
+                if ((acl && (request->atyp == 1 || request->atyp == 4) && acl_match_ip(host))) {
                     if (verbose) {
                         LOGI("bypass %s:%s", host, port);
                     }
                     struct sockaddr_storage storage;
                     memset(&storage, 0, sizeof(struct sockaddr_storage));
                     if (get_sockaddr(host, port, &storage, 0) != -1) {
-                        remote = create_remote(server->listener, (struct sockaddr *)&storage);
+                        remote         = create_remote(server->listener, (struct sockaddr *)&storage);
                         remote->direct = 1;
                     }
                 } else {
@@ -463,45 +504,59 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                 }
 
                 if (remote == NULL) {
+                    bfree(abuf);
                     LOGE("invalid remote addr");
                     close_and_free_server(EV_A_ server);
                     return;
                 }
 
                 if (!remote->direct) {
-                    memcpy(remote->buf, ss_addr_to_send, addr_len);
-                    if (r > 0) {
-                        memcpy(remote->buf + addr_len, buf, r);
+                    if (auth) {
+                        abuf->array[0] |= ONETIMEAUTH_FLAG;
+                        ss_onetimeauth(abuf, server->e_ctx->evp.iv, BUF_SIZE);
                     }
-                    r += addr_len;
+
+                    brealloc(remote->buf, buf->len + abuf->len, BUF_SIZE);
+                    memcpy(remote->buf->array, abuf->array, abuf->len);
+                    remote->buf->len = buf->len + abuf->len;
+
+                    if (buf->len > 0) {
+                        if (auth) {
+                            ss_gen_hash(buf, &remote->counter, server->e_ctx, BUF_SIZE);
+                        }
+                        memcpy(remote->buf->array + abuf->len, buf->array, buf->len);
+                    }
                 } else {
-                    if (r > 0) {
-                        memcpy(remote->buf, buf, r);
+                    if (buf->len > 0) {
+                        memcpy(remote->buf->array, buf->array, buf->len);
+                        remote->buf->len = buf->len;
                     }
                 }
 
                 server->remote = remote;
                 remote->server = server;
+
+                bfree(abuf);
             }
 
             // Fake reply
             struct socks5_response response;
-            response.ver = SVERSION;
-            response.rep = 0;
-            response.rsv = 0;
+            response.ver  = SVERSION;
+            response.rep  = 0;
+            response.rsv  = 0;
             response.atyp = 1;
 
-            memcpy(server->buf, &response, sizeof(struct socks5_response));
-            memcpy(server->buf + sizeof(struct socks5_response),
+            memcpy(server->buf->array, &response, sizeof(struct socks5_response));
+            memcpy(server->buf->array + sizeof(struct socks5_response),
                    &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
-            memcpy(server->buf + sizeof(struct socks5_response) +
+            memcpy(server->buf->array + sizeof(struct socks5_response) +
                    sizeof(sock_addr.sin_addr),
                    &sock_addr.sin_port, sizeof(sock_addr.sin_port));
 
             int reply_size = sizeof(struct socks5_response) +
                              sizeof(sock_addr.sin_addr) +
                              sizeof(sock_addr.sin_port);
-            int s = send(server->fd, server->buf, reply_size, 0);
+            int s = send(server->fd, server->buf->array, reply_size, 0);
             if (s < reply_size) {
                 LOGE("failed to send fake reply");
                 close_and_free_remote(EV_A_ remote);
@@ -520,47 +575,59 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
 static void server_send_cb(EV_P_ ev_io *w, int revents)
 {
-    struct server_ctx *server_send_ctx = (struct server_ctx *)w;
-    struct server *server = server_send_ctx->server;
-    struct remote *remote = server->remote;
-    if (server->buf_len == 0) {
+    server_ctx_t *server_send_ctx = (server_ctx_t *)w;
+    server_t *server              = server_send_ctx->server;
+    remote_t *remote              = server->remote;
+    if (server->buf->len == 0) {
         // close and free
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
     } else {
         // has data to send
-        ssize_t s = send(server->fd, server->buf + server->buf_idx,
-                         server->buf_len, 0);
-        if (s < 0) {
+        ssize_t s = send(server->fd, server->buf->array + server->buf->idx,
+                         server->buf->len, 0);
+        if (s == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 ERROR("server_send_cb_send");
                 close_and_free_remote(EV_A_ remote);
                 close_and_free_server(EV_A_ server);
             }
             return;
-        } else if (s < server->buf_len) {
+        } else if (s < (ssize_t)(server->buf->len)) {
             // partly sent, move memory, wait for the next time to send
-            server->buf_len -= s;
-            server->buf_idx += s;
+            server->buf->len -= s;
+            server->buf->idx += s;
             return;
         } else {
             // all sent out, wait for reading
-            server->buf_len = 0;
-            server->buf_idx = 0;
+            server->buf->len = 0;
+            server->buf->idx = 0;
             ev_io_stop(EV_A_ & server_send_ctx->io);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
+            return;
         }
     }
-
 }
+
+#ifdef ANDROID
+static void stat_update_cb(struct ev_loop *loop)
+{
+    ev_tstamp now = ev_now(loop);
+    if (now - last > 1.0) {
+        send_traffic_stat(tx, rx);
+        last = now;
+    }
+}
+
+#endif
 
 static void remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 {
-    struct remote_ctx *remote_ctx = (struct remote_ctx *)(((void *)watcher)
-                                                          - sizeof(ev_io));
-    struct remote *remote = remote_ctx->remote;
-    struct server *server = remote->server;
+    remote_ctx_t *remote_ctx = (remote_ctx_t *)(((void *)watcher)
+                                                - sizeof(ev_io));
+    remote_t *remote = remote_ctx->remote;
+    server_t *server = remote->server;
 
     if (verbose) {
         LOGI("TCP connection timeout");
@@ -572,20 +639,24 @@ static void remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 
 static void remote_recv_cb(EV_P_ ev_io *w, int revents)
 {
-    struct remote_ctx *remote_recv_ctx = (struct remote_ctx *)w;
-    struct remote *remote = remote_recv_ctx->remote;
-    struct server *server = remote->server;
+    remote_ctx_t *remote_recv_ctx = (remote_ctx_t *)w;
+    remote_t *remote              = remote_recv_ctx->remote;
+    server_t *server              = remote->server;
 
     ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
 
-    ssize_t r = recv(remote->fd, server->buf, BUF_SIZE, 0);
+#ifdef ANDROID
+    stat_update_cb(loop);
+#endif
+
+    ssize_t r = recv(remote->fd, server->buf->array, BUF_SIZE, 0);
 
     if (r == 0) {
         // connection closed
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
-    } else if (r < 0) {
+    } else if (r == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data
             // continue to wait for recv
@@ -598,9 +669,14 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
+    server->buf->len = r;
+
     if (!remote->direct) {
-        server->buf = ss_decrypt(BUF_SIZE, server->buf, &r, server->d_ctx);
-        if (server->buf == NULL) {
+#ifdef ANDROID
+        rx += server->buf->len;
+#endif
+        int err = ss_decrypt(server->buf, server->d_ctx, BUF_SIZE);
+        if (err) {
             LOGE("invalid password or cipher");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
@@ -608,41 +684,42 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
-    int s = send(server->fd, server->buf, r, 0);
+    int s = send(server->fd, server->buf->array, server->buf->len, 0);
 
     if (s == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data, wait for send
-            server->buf_len = r;
-            server->buf_idx = 0;
+            server->buf->idx = 0;
             ev_io_stop(EV_A_ & remote_recv_ctx->io);
             ev_io_start(EV_A_ & server->send_ctx->io);
-            return;
         } else {
             ERROR("remote_recv_cb_send");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
-            return;
         }
-    } else if (s < r) {
-        server->buf_len = r - s;
-        server->buf_idx = s;
+    } else if (s < (int)(server->buf->len)) {
+        server->buf->len -= s;
+        server->buf->idx  = s;
         ev_io_stop(EV_A_ & remote_recv_ctx->io);
         ev_io_start(EV_A_ & server->send_ctx->io);
-        return;
     }
+
+    // Disable TCP_NODELAY after the first response are sent
+    int opt = 0;
+    setsockopt(server->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(remote->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
 static void remote_send_cb(EV_P_ ev_io *w, int revents)
 {
-    struct remote_ctx *remote_send_ctx = (struct remote_ctx *)w;
-    struct remote *remote = remote_send_ctx->remote;
-    struct server *server = remote->server;
+    remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
+    remote_t *remote              = remote_send_ctx->remote;
+    server_t *server              = remote->server;
 
     if (!remote_send_ctx->connected) {
         struct sockaddr_storage addr;
         socklen_t len = sizeof addr;
-        int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
+        int r         = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
         if (r == 0) {
             remote_send_ctx->connected = 1;
             ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
@@ -650,7 +727,7 @@ static void remote_send_cb(EV_P_ ev_io *w, int revents)
             ev_io_start(EV_A_ & remote->recv_ctx->io);
 
             // no need to send any data
-            if (remote->buf_len == 0) {
+            if (remote->buf->len == 0) {
                 ev_io_stop(EV_A_ & remote_send_ctx->io);
                 ev_io_start(EV_A_ & server->recv_ctx->io);
                 return;
@@ -664,16 +741,16 @@ static void remote_send_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
-    if (remote->buf_len == 0) {
+    if (remote->buf->len == 0) {
         // close and free
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
     } else {
         // has data to send
-        ssize_t s = send(remote->fd, remote->buf + remote->buf_idx,
-                         remote->buf_len, 0);
-        if (s < 0) {
+        ssize_t s = send(remote->fd, remote->buf->array + remote->buf->idx,
+                         remote->buf->len, 0);
+        if (s == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 ERROR("remote_send_cb_send");
                 // close and free
@@ -681,63 +758,64 @@ static void remote_send_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_server(EV_A_ server);
             }
             return;
-        } else if (s < remote->buf_len) {
+        } else if (s < (ssize_t)(remote->buf->len)) {
             // partly sent, move memory, wait for the next time to send
-            remote->buf_len -= s;
-            remote->buf_idx += s;
+            remote->buf->len -= s;
+            remote->buf->idx += s;
             return;
         } else {
             // all sent out, wait for reading
-            remote->buf_len = 0;
-            remote->buf_idx = 0;
+            remote->buf->len = 0;
+            remote->buf->idx = 0;
             ev_io_stop(EV_A_ & remote_send_ctx->io);
             ev_io_start(EV_A_ & server->recv_ctx->io);
         }
     }
 }
 
-static struct remote * new_remote(int fd, int timeout)
+static remote_t *new_remote(int fd, int timeout)
 {
-    struct remote *remote;
-    remote = malloc(sizeof(struct remote));
+    remote_t *remote;
+    remote = ss_malloc(sizeof(remote_t));
 
-    memset(remote, 0, sizeof(struct remote));
+    memset(remote, 0, sizeof(remote_t));
 
-    remote->buf = malloc(BUF_SIZE);
-    remote->recv_ctx = malloc(sizeof(struct remote_ctx));
-    remote->send_ctx = malloc(sizeof(struct remote_ctx));
+    remote->buf                 = ss_malloc(sizeof(buffer_t));
+    remote->recv_ctx            = ss_malloc(sizeof(remote_ctx_t));
+    remote->send_ctx            = ss_malloc(sizeof(remote_ctx_t));
     remote->recv_ctx->connected = 0;
     remote->send_ctx->connected = 0;
-    remote->fd = fd;
+    remote->fd                  = fd;
+    remote->recv_ctx->remote    = remote;
+    remote->send_ctx->remote    = remote;
+
     ev_io_init(&remote->recv_ctx->io, remote_recv_cb, fd, EV_READ);
     ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
     ev_timer_init(&remote->send_ctx->watcher, remote_timeout_cb,
-                  min(MAX_CONNECT_TIMEOUT,
-                      timeout),
-                  0);
+                  min(MAX_CONNECT_TIMEOUT, timeout), 0);
     ev_timer_init(&remote->recv_ctx->watcher, remote_timeout_cb,
-                  min(MAX_CONNECT_TIMEOUT,
-                      timeout),
-                  timeout);
-    remote->recv_ctx->remote = remote;
-    remote->send_ctx->remote = remote;
+                  min(MAX_CONNECT_TIMEOUT, timeout), timeout);
+
+    balloc(remote->buf, BUF_SIZE);
+
     return remote;
 }
 
-static void free_remote(struct remote *remote)
+static void free_remote(remote_t *remote)
 {
     if (remote->server != NULL) {
         remote->server->remote = NULL;
     }
     if (remote->buf != NULL) {
-        free(remote->buf);
+        bfree(remote->buf);
+        ss_free(remote->buf);
     }
-    free(remote->recv_ctx);
-    free(remote->send_ctx);
-    free(remote);
+    ss_free(remote->recv_ctx);
+    ss_free(remote->send_ctx);
+    ss_free(remote);
 }
 
-static void close_and_free_remote(EV_P_ struct remote *remote)
+static void close_and_free_remote(EV_P_ remote_t *remote)
 {
     if (remote != NULL) {
         ev_timer_stop(EV_A_ & remote->send_ctx->watcher);
@@ -749,26 +827,25 @@ static void close_and_free_remote(EV_P_ struct remote *remote)
     }
 }
 
-static struct server * new_server(int fd, int method)
+static server_t *new_server(int fd, int method)
 {
-    struct server *server;
-    server = malloc(sizeof(struct server));
+    server_t *server;
+    server = ss_malloc(sizeof(server_t));
 
-    memset(server, 0, sizeof(struct server));
+    memset(server, 0, sizeof(server_t));
 
-    server->buf = malloc(BUF_SIZE);
-    server->recv_ctx = malloc(sizeof(struct server_ctx));
-    server->send_ctx = malloc(sizeof(struct server_ctx));
+    server->recv_ctx            = ss_malloc(sizeof(server_ctx_t));
+    server->send_ctx            = ss_malloc(sizeof(server_ctx_t));
+    server->buf                 = ss_malloc(sizeof(buffer_t));
     server->recv_ctx->connected = 0;
     server->send_ctx->connected = 0;
-    server->fd = fd;
-    ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
-    ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
-    server->recv_ctx->server = server;
-    server->send_ctx->server = server;
+    server->fd                  = fd;
+    server->recv_ctx->server    = server;
+    server->send_ctx->server    = server;
+
     if (method) {
-        server->e_ctx = malloc(sizeof(struct enc_ctx));
-        server->d_ctx = malloc(sizeof(struct enc_ctx));
+        server->e_ctx = ss_malloc(sizeof(struct enc_ctx));
+        server->d_ctx = ss_malloc(sizeof(struct enc_ctx));
         enc_ctx_init(method, server->e_ctx, 1);
         enc_ctx_init(method, server->d_ctx, 0);
     } else {
@@ -776,12 +853,17 @@ static struct server * new_server(int fd, int method)
         server->d_ctx = NULL;
     }
 
+    ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
+    ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
+
+    balloc(server->buf, BUF_SIZE);
+
     cork_dllist_add(&connections, &server->entries);
 
     return server;
 }
 
-static void free_server(struct server *server)
+static void free_server(server_t *server)
 {
     cork_dllist_remove(&server->entries);
 
@@ -790,21 +872,22 @@ static void free_server(struct server *server)
     }
     if (server->e_ctx != NULL) {
         cipher_context_release(&server->e_ctx->evp);
-        free(server->e_ctx);
+        ss_free(server->e_ctx);
     }
     if (server->d_ctx != NULL) {
         cipher_context_release(&server->d_ctx->evp);
-        free(server->d_ctx);
+        ss_free(server->d_ctx);
     }
     if (server->buf != NULL) {
-        free(server->buf);
+        bfree(server->buf);
+        ss_free(server->buf);
     }
-    free(server->recv_ctx);
-    free(server->send_ctx);
-    free(server);
+    ss_free(server->recv_ctx);
+    ss_free(server->send_ctx);
+    ss_free(server);
 }
 
-static void close_and_free_server(EV_P_ struct server *server)
+static void close_and_free_server(EV_P_ server_t *server)
 {
     if (server != NULL) {
         ev_io_stop(EV_A_ & server->send_ctx->io);
@@ -814,8 +897,8 @@ static void close_and_free_server(EV_P_ struct server *server)
     }
 }
 
-static struct remote * create_remote(struct listen_ctx *listener,
-                                         struct sockaddr *addr)
+static remote_t *create_remote(listen_ctx_t *listener,
+                               struct sockaddr *addr)
 {
     struct sockaddr *remote_addr;
 
@@ -828,7 +911,7 @@ static struct remote * create_remote(struct listen_ctx *listener,
 
     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
 
-    if (remotefd < 0) {
+    if (remotefd == -1) {
         ERROR("socket");
         return NULL;
     }
@@ -839,15 +922,23 @@ static struct remote * create_remote(struct listen_ctx *listener,
     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
+    if (listener->mptcp == 1) {
+        int err = setsockopt(remotefd, SOL_TCP, MPTCP_ENABLED, &opt, sizeof(opt));
+        if (err == -1) {
+            ERROR("failed to enable multipath TCP");
+        }
+    }
+
     // Setup
     setnonblocking(remotefd);
 #ifdef SET_INTERFACE
     if (listener->iface) {
-        setinterface(remotefd, listener->iface);
+        if (setinterface(remotefd, listener->iface) == -1)
+            ERROR("setinterface");
     }
 #endif
 
-    struct remote *remote = new_remote(remotefd, listener->timeout);
+    remote_t *remote = new_remote(remotefd, listener->timeout);
     remote->addr_len = get_sockaddr_len(remote_addr);
     memcpy(&(remote->addr), remote_addr, remote->addr_len);
 
@@ -860,6 +951,9 @@ static void signal_cb(EV_P_ ev_signal *w, int revents)
         switch (w->signum) {
         case SIGINT:
         case SIGTERM:
+#ifndef __MINGW32__
+        case SIGUSR1:
+#endif
             ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
@@ -867,8 +961,8 @@ static void signal_cb(EV_P_ ev_signal *w, int revents)
 
 void accept_cb(EV_P_ ev_io *w, int revents)
 {
-    struct listen_ctx *listener = (struct listen_ctx *)w;
-    int serverfd = accept(listener->fd, NULL, NULL);
+    listen_ctx_t *listener = (listen_ctx_t *)w;
+    int serverfd           = accept(listener->fd, NULL, NULL);
     if (serverfd == -1) {
         ERROR("accept");
         return;
@@ -880,27 +974,32 @@ void accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
-    struct server *server = new_server(serverfd, listener->method);
+    server_t *server = new_server(serverfd, listener->method);
     server->listener = listener;
 
     ev_io_start(EV_A_ & server->recv_ctx->io);
 }
 
+void resolve_int_cb(int dummy) {
+    keep_resolving = 0;
+}
+
 #ifndef LIB_ONLY
 int main(int argc, char **argv)
 {
-
     int i, c;
-    int pid_flags = 0;
-    char *user = NULL;
+    int pid_flags    = 0;
+    int mtu          = 0;
+    int mptcp        = 0;
+    char *user       = NULL;
     char *local_port = NULL;
     char *local_addr = NULL;
-    char *password = NULL;
-    char *timeout = NULL;
-    char *method = NULL;
-    char *pid_path = NULL;
-    char *conf_path = NULL;
-    char *iface = NULL;
+    char *password   = NULL;
+    char *timeout    = NULL;
+    char *method     = NULL;
+    char *pid_path   = NULL;
+    char *conf_path  = NULL;
+    char *iface      = NULL;
 
     srand(time(NULL));
 
@@ -908,12 +1007,14 @@ int main(int argc, char **argv)
     ss_addr_t remote_addr[MAX_REMOTE_NUM];
     char *remote_port = NULL;
 
-    int option_index = 0;
-    static struct option long_options[] =
-    {
-        { "fast-open", no_argument,       0, 0 },
-        { "acl",       required_argument, 0, 0 },
-        { 0,           0,                 0, 0 }
+    int option_index                    = 0;
+    static struct option long_options[] = {
+        { "fast-open", no_argument      , 0, 0 },
+        { "acl"      , required_argument, 0, 0 },
+        { "mtu"      , required_argument, 0, 0 },
+        { "mptcp"    , no_argument      , 0, 0 },
+        { "help"     , no_argument      , 0, 0 },
+        {           0,                 0, 0, 0 }
     };
 
     opterr = 0;
@@ -921,10 +1022,10 @@ int main(int argc, char **argv)
     USE_TTY();
 
 #ifdef ANDROID
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:uvV",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:P:huUvVA",
                             long_options, &option_index)) != -1) {
 #else
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:uv",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUvA",
                             long_options, &option_index)) != -1) {
 #endif
         switch (c) {
@@ -932,13 +1033,22 @@ int main(int argc, char **argv)
             if (option_index == 0) {
                 fast_open = 1;
             } else if (option_index == 1) {
-                LOGI("initialize acl...");
-                acl = !init_acl(optarg);
+                LOGI("initializing acl...");
+                acl = !init_acl(optarg, BLACK_LIST);
+            } else if (option_index == 2) {
+                mtu = atoi(optarg);
+                LOGI("set MTU to %d", mtu);
+            } else if (option_index == 3) {
+                mptcp = 1;
+                LOGI("enable multipath TCP");
+            } else if (option_index == 4) {
+                usage();
+                exit(EXIT_SUCCESS);
             }
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
-                remote_addr[remote_num].host = optarg;
+                remote_addr[remote_num].host   = optarg;
                 remote_addr[remote_num++].port = NULL;
             }
             break;
@@ -953,7 +1063,7 @@ int main(int argc, char **argv)
             break;
         case 'f':
             pid_flags = 1;
-            pid_path = optarg;
+            pid_path  = optarg;
             break;
         case 't':
             timeout = optarg;
@@ -973,17 +1083,38 @@ int main(int argc, char **argv)
         case 'a':
             user = optarg;
             break;
+#ifdef HAVE_SETRLIMIT
+        case 'n':
+            nofile = atoi(optarg);
+            break;
+#endif
         case 'u':
             mode = TCP_AND_UDP;
             break;
+        case 'U':
+            mode = UDP_ONLY;
+            break;
         case 'v':
             verbose = 1;
+            break;
+        case 'h':
+            usage();
+            exit(EXIT_SUCCESS);
+        case 'A':
+            auth = 1;
             break;
 #ifdef ANDROID
         case 'V':
             vpn = 1;
             break;
+        case 'P':
+            prefix = optarg;
+            break;
 #endif
+        case '?':
+            // The option character is not recognized.
+            opterr = 1;
+            break;
         }
     }
 
@@ -1001,9 +1132,8 @@ int main(int argc, char **argv)
         jconf_t *conf = read_jconf(conf_path);
         if (remote_num == 0) {
             remote_num = conf->remote_num;
-            for (i = 0; i < remote_num; i++) {
+            for (i = 0; i < remote_num; i++)
                 remote_addr[i] = conf->remote_addr[i];
-            }
         }
         if (remote_port == NULL) {
             remote_port = conf->remote_port;
@@ -1023,8 +1153,20 @@ int main(int argc, char **argv)
         if (timeout == NULL) {
             timeout = conf->timeout;
         }
+        if (auth == 0) {
+            auth = conf->auth;
+        }
         if (fast_open == 0) {
             fast_open = conf->fast_open;
+        }
+        if (mode == TCP_ONLY) {
+            mode = conf->mode;
+        }
+        if (mtu == 0) {
+            mtu = conf->mtu;
+        }
+        if (mptcp == 0) {
+            mptcp = conf->mptcp;
         }
 #ifdef HAVE_SETRLIMIT
         if (nofile == 0) {
@@ -1034,7 +1176,7 @@ int main(int argc, char **argv)
          * no need to check the return value here since we will show
          * the user an error message if setrlimit(2) fails
          */
-        if (nofile) {
+        if (nofile > 1024) {
             if (verbose) {
                 LOGI("setting NOFILE to %d", nofile);
             }
@@ -1070,34 +1212,33 @@ int main(int argc, char **argv)
 #endif
     }
 
+    if (auth) {
+        LOGI("onetime authentication enabled");
+    }
+
 #ifdef __MINGW32__
     winsock_init();
 #else
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
+    signal(SIGINT,  resolve_int_cb);
+    signal(SIGTERM, resolve_int_cb);
 #endif
 
-    struct ev_signal sigint_watcher;
-    struct ev_signal sigterm_watcher;
-    ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
-    ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
-    ev_signal_start(EV_DEFAULT, &sigint_watcher);
-    ev_signal_start(EV_DEFAULT, &sigterm_watcher);
-
     // Setup keys
-    LOGI("initialize ciphers... %s", method);
+    LOGI("initializing ciphers... %s", method);
     int m = enc_init(password, method);
 
     // Setup proxy context
-    struct listen_ctx listen_ctx;
-    listen_ctx.remote_num = remote_num;
-    listen_ctx.remote_addr = malloc(sizeof(struct sockaddr *) * remote_num);
+    listen_ctx_t listen_ctx;
+    listen_ctx.remote_num  = remote_num;
+    listen_ctx.remote_addr = ss_malloc(sizeof(struct sockaddr *) * remote_num);
     for (i = 0; i < remote_num; i++) {
         char *host = remote_addr[i].host;
         char *port = remote_addr[i].port == NULL ? remote_port :
-            remote_addr[i].port;
-        struct sockaddr_storage *storage = malloc(sizeof(struct sockaddr_storage));
+                     remote_addr[i].port;
+        struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
         memset(storage, 0, sizeof(struct sockaddr_storage));
         if (get_sockaddr(host, port, storage, 1) == -1) {
             FATAL("failed to resolve the provided hostname");
@@ -1105,32 +1246,43 @@ int main(int argc, char **argv)
         listen_ctx.remote_addr[i] = (struct sockaddr *)storage;
     }
     listen_ctx.timeout = atoi(timeout);
-    listen_ctx.iface = iface;
-    listen_ctx.method = m;
+    listen_ctx.iface   = iface;
+    listen_ctx.method  = m;
+    listen_ctx.mptcp   = mptcp;
+
+    // Setup signal handler
+    struct ev_signal sigint_watcher;
+    struct ev_signal sigterm_watcher;
+    ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
+    ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
+    ev_signal_start(EV_DEFAULT, &sigint_watcher);
+    ev_signal_start(EV_DEFAULT, &sigterm_watcher);
 
     struct ev_loop *loop = EV_DEFAULT;
 
-    // Setup socket
-    int listenfd;
-    listenfd = create_and_bind(local_addr, local_port);
-    if (listenfd < 0) {
-        FATAL("bind() error");
-    }
-    if (listen(listenfd, SOMAXCONN) == -1) {
-        FATAL("listen() error");
-    }
-    setnonblocking(listenfd);
+    if (mode != UDP_ONLY) {
+        // Setup socket
+        int listenfd;
+        listenfd = create_and_bind(local_addr, local_port);
+        if (listenfd == -1) {
+            FATAL("bind() error");
+        }
+        if (listen(listenfd, SOMAXCONN) == -1) {
+            FATAL("listen() error");
+        }
+        setnonblocking(listenfd);
 
-    listen_ctx.fd = listenfd;
+        listen_ctx.fd = listenfd;
 
-    ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
-    ev_io_start(loop, &listen_ctx.io);
+        ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
+        ev_io_start(loop, &listen_ctx.io);
+    }
 
     // Setup UDP
     if (mode != TCP_ONLY) {
         LOGI("udprelay enabled");
         init_udprelay(local_addr, local_port, listen_ctx.remote_addr[0],
-                      get_sockaddr_len(listen_ctx.remote_addr[0]), m, listen_ctx.timeout, iface);
+                      get_sockaddr_len(listen_ctx.remote_addr[0]), mtu, m, auth, listen_ctx.timeout, iface);
     }
 
     LOGI("listening at %s:%s", local_addr, local_port);
@@ -1151,17 +1303,20 @@ int main(int argc, char **argv)
     }
 
     // Clean up
-    ev_io_stop(loop, &listen_ctx.io);
-    free_connections(loop);
+
+    if (mode != UDP_ONLY) {
+        ev_io_stop(loop, &listen_ctx.io);
+        free_connections(loop);
+
+        for (i = 0; i < remote_num; i++)
+            ss_free(listen_ctx.remote_addr[i]);
+        ss_free(listen_ctx.remote_addr);
+    }
+
 
     if (mode != TCP_ONLY) {
         free_udprelay();
     }
-
-    for (i = 0; i < remote_num; i++) {
-        free(listen_ctx.remote_addr[i]);
-    }
-    free(listen_ctx.remote_addr);
 
 #ifdef __MINGW32__
     winsock_cleanup();
@@ -1180,17 +1335,22 @@ int start_ss_local_server(profile_t profile)
     srand(time(NULL));
 
     char *remote_host = profile.remote_host;
-    char *local_addr = profile.local_addr;
-    char *method = profile.method;
-    char *password = profile.password;
-    char *log = profile.log;
-    int remote_port = profile.remote_port;
-    int local_port = profile.local_port;
-    int timeout = profile.timeout;
+    char *local_addr  = profile.local_addr;
+    char *method      = profile.method;
+    char *password    = profile.password;
+    char *log         = profile.log;
+    int remote_port   = profile.remote_port;
+    int local_port    = profile.local_port;
+    int timeout       = profile.timeout;
+    int mtu           = 0;
+    int mptcp         = 0;
 
-    mode = profile.mode;
+    auth      = profile.auth;
+    mode      = profile.mode;
     fast_open = profile.fast_open;
-    verbose = profile.verbose;
+    verbose   = profile.verbose;
+    mtu       = profile.mtu;
+    mptcp     = profile.mptcp;
 
     char local_port_str[16];
     char remote_port_str[16];
@@ -1200,7 +1360,7 @@ int start_ss_local_server(profile_t profile)
     USE_LOGFILE(log);
 
     if (profile.acl != NULL) {
-        acl = !init_acl(profile.acl);
+        acl = !init_acl(profile.acl, BLACK_LIST);
     }
 
     if (local_addr == NULL) {
@@ -1221,12 +1381,17 @@ int start_ss_local_server(profile_t profile)
     ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
     ev_signal_start(EV_DEFAULT, &sigint_watcher);
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+#ifndef __MINGW32__
+    struct ev_signal sigusr1_watcher;
+    ev_signal_init(&sigusr1_watcher, signal_cb, SIGUSR1);
+    ev_signal_start(EV_DEFAULT, &sigusr1_watcher);
+#endif
 
     // Setup keys
-    LOGI("initialize ciphers... %s", method);
+    LOGI("initializing ciphers... %s", method);
     int m = enc_init(password, method);
 
-    struct sockaddr_storage *storage = malloc(sizeof(struct sockaddr_storage));
+    struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
     memset(storage, 0, sizeof(struct sockaddr_storage));
     if (get_sockaddr(remote_host, remote_port_str, storage, 1) == -1) {
         return -1;
@@ -1234,39 +1399,43 @@ int start_ss_local_server(profile_t profile)
 
     // Setup proxy context
     struct ev_loop *loop = EV_DEFAULT;
-    struct listen_ctx listen_ctx;
 
-    listen_ctx.remote_num = 1;
-    listen_ctx.remote_addr = malloc(sizeof(struct sockaddr *));
+    listen_ctx_t listen_ctx;
+    listen_ctx.remote_num     = 1;
+    listen_ctx.remote_addr    = ss_malloc(sizeof(struct sockaddr *));
     listen_ctx.remote_addr[0] = (struct sockaddr *)storage;
-    listen_ctx.timeout = timeout;
-    listen_ctx.method = m;
-    listen_ctx.iface = NULL;
+    listen_ctx.timeout        = timeout;
+    listen_ctx.method         = m;
+    listen_ctx.iface          = NULL;
+    listen_ctx.mptcp          = mptcp;
 
-    // Setup socket
-    int listenfd;
-    listenfd = create_and_bind(local_addr, local_port_str);
-    if (listenfd < 0) {
-        ERROR("bind()");
-        return -1;
+    if (mode != UDP_ONLY) {
+
+        // Setup socket
+        int listenfd;
+        listenfd = create_and_bind(local_addr, local_port_str);
+        if (listenfd == -1) {
+            ERROR("bind()");
+            return -1;
+        }
+        if (listen(listenfd, SOMAXCONN) == -1) {
+            ERROR("listen()");
+            return -1;
+        }
+        setnonblocking(listenfd);
+
+        listen_ctx.fd = listenfd;
+
+        ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
+        ev_io_start(loop, &listen_ctx.io);
     }
-    if (listen(listenfd, SOMAXCONN) == -1) {
-        ERROR("listen()");
-        return -1;
-    }
-    setnonblocking(listenfd);
-
-    listen_ctx.fd = listenfd;
-
-    ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
-    ev_io_start(loop, &listen_ctx.io);
 
     // Setup UDP
     if (mode != TCP_ONLY) {
         LOGI("udprelay enabled");
         struct sockaddr *addr = (struct sockaddr *)storage;
         init_udprelay(local_addr, local_port_str, addr,
-                      get_sockaddr_len(addr), m, timeout, NULL);
+                      get_sockaddr_len(addr), mtu, m, auth, timeout, NULL);
     }
 
     LOGI("listening at %s:%s", local_addr, local_port_str);
@@ -1286,11 +1455,13 @@ int start_ss_local_server(profile_t profile)
         free_udprelay();
     }
 
-    ev_io_stop(loop, &listen_ctx.io);
-    free_connections(loop);
-    close(listen_ctx.fd);
+    if (mode != UDP_ONLY) {
+        ev_io_stop(loop, &listen_ctx.io);
+        free_connections(loop);
+        close(listen_ctx.fd);
+    }
 
-    free(listen_ctx.remote_addr);
+    ss_free(listen_ctx.remote_addr);
 
 #ifdef __MINGW32__
     winsock_cleanup();
@@ -1298,10 +1469,12 @@ int start_ss_local_server(profile_t profile)
 
     ev_signal_stop(EV_DEFAULT, &sigint_watcher);
     ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+#ifndef __MINGW32__
+    ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
+#endif
 
     // cannot reach here
     return 0;
 }
 
 #endif
-
